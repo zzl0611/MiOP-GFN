@@ -1,0 +1,34 @@
+name: amp-moo-gfn
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - pyyaml
+  - requests
+  - flask
+  - rdkit
+  - pytorch
+  - torchvision
+  - cpuonly
+  - pip:
+      - omegaconf==2.1.2
+      - GitPython
+      - tensorboard
+      - torch-geometric
+      - torch-scatter
+      - botorch
+      - gpytorch
+      - modlamp
+      - transformers
+      - tokenizers
+      - joblib
+      - fair-esm
+
