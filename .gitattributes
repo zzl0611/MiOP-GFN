@@ -1,0 +1,2 @@
+predictors/bert_mic/artifacts/backbone/pytorch_model.bin filter=lfs diff=lfs merge=lfs -text
+predictors/bert_mic/artifacts/best_model_state_dict.pkl filter=lfs diff=lfs merge=lfs -text

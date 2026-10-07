@@ -84,11 +84,7 @@ class AMPReproducibilityManifestTest(unittest.TestCase):
         self.ctx = make_context()
         self.model = make_model()
         self.algo = namespace(
-            offline_stop_loss_weight=0.5,
-            online_stop_len=20,
-            online_stop_loss_weight=0.3,
             motif_usage_loss_weight=0.1,
-            motif_diversity_loss_weight=0.05,
             pareto_len_limit=30,
             replay_len_limit=30,
         )

@@ -137,11 +137,7 @@ def build_amp_reproducibility_manifest(
             "motif_select_gate_strength": float(model.motif_select_gate_strength),
         },
         "losses": {
-            "offline_stop_loss_weight": float(algo.offline_stop_loss_weight),
-            "online_stop_len": int(algo.online_stop_len),
-            "online_stop_loss_weight": float(algo.online_stop_loss_weight),
             "motif_usage_loss_weight": float(algo.motif_usage_loss_weight),
-            "motif_diversity_loss_weight": float(algo.motif_diversity_loss_weight),
             "pareto_len_limit": int(algo.pareto_len_limit),
         },
         "replay": {

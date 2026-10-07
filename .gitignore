@@ -167,16 +167,7 @@ sehstr_gbtr_allpreds.pkl
 saved_models
 wandb
 *.sh
-multi/logs/
-multi/analysis_results/
-multi/AMPlify/
-multi/amPEPpy/
-
 # AMP-MOO experiment outputs
-multi/results/
-multi/formal_samples/
-multi/sampled_*/
-multi/analysis_code/baseline_logs/
-multi/amp_oracle/runs/
-multi/**/generated_mols_*.db
-multi/**/events.out.tfevents.*
+outputs/
+**/generated_mols_*.db
+**/events.out.tfevents.*

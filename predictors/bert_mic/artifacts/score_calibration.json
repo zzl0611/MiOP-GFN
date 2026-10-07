@@ -1,0 +1,15 @@
+{
+  "score_type": "sigmoid_calibrated_pmic",
+  "pmic_q05": -2.301029920578003,
+  "pmic_q50": -1.1638623476028442,
+  "pmic_q95": 0.2041199803352356,
+  "temperature": 0.6262874752283096,
+  "formula": "mic_score = sigmoid((pred_pmic - pmic_q50) / temperature)",
+  "seed": 0,
+  "batch_size": 64,
+  "lr": 1e-05,
+  "weight_decay": 0.003,
+  "epochs": 100,
+  "frozen_layers": 0,
+  "best_test_mse": 0.2831416428089142
+}

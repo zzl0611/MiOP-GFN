@@ -1,5 +1,7 @@
 import os
 import re
+import importlib.util
+from pathlib import Path
 from typing import List, Dict
 
 import torch
@@ -7,21 +9,36 @@ from flask import Flask, request, jsonify
 from transformers import AutoTokenizer, EsmForSequenceClassification
 
 
-# ==========================================================
-# 1. HemoPI2 本地模型路径
-# ==========================================================
-MODEL_DIR = "/home/lzz/anaconda3/envs/op_gfn_mo/lib/python3.9/site-packages/hemopi2/Model"
+def resolve_model_dir() -> Path:
+    """Resolve the HemoPI2 model without assuming a server/Conda path."""
+    configured = os.environ.get("HEMO_MODEL_DIR")
+    if configured:
+        model_dir = Path(configured).expanduser().resolve()
+    else:
+        spec = importlib.util.find_spec("hemopi2")
+        package_dir = Path(spec.origin).resolve().parent if spec and spec.origin else None
+        model_dir = package_dir / "Model" if package_dir else None
+
+    if model_dir is None or not model_dir.is_dir():
+        raise FileNotFoundError(
+            "HemoPI2 model directory was not found. Set HEMO_MODEL_DIR to the "
+            "directory containing the local tokenizer/model files."
+        )
+    return model_dir
+
+
+MODEL_DIR = resolve_model_dir()
 
 VALID_AA = "ACDEFGHIKLMNPQRSTVWY"
 
 app = Flask(__name__)
 
 print("=" * 60)
-print("⏳ 正在启动 HemoPI2 ESM GPU 微服务...")
-print(f"📂 HemoPI2 模型路径: {MODEL_DIR}")
+print("[HemoPI2] starting ESM reward service")
+print(f"[HemoPI2] model directory: {MODEL_DIR}")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"🚀 HemoPI2 推理设备: {device}")
+print(f"[HemoPI2] device: {device}")
 
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_DIR,
@@ -39,8 +56,18 @@ model.eval()
 # 简单缓存：同一条序列算过一次就不再重复算
 CACHE: Dict[str, float] = {}
 
-print("✅ HemoPI2 ESM 模型已常驻内存！")
+print("[HemoPI2] model loaded")
 print("=" * 60)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "device": str(device),
+        "model_dir": str(MODEL_DIR),
+        "score_type": "hemolytic_probability",
+    })
 
 
 def clean_sequence(seq: str) -> str:
@@ -147,5 +174,5 @@ def predict():
 
 if __name__ == "__main__":
     run_port = int(os.environ.get("HEMO_PORT", 5006))
-    print(f"📡 HemoPI2 微服务监听地址: http://127.0.0.1:{run_port}/predict")
-    app.run(host="127.0.0.1", port=run_port, threaded=False)
+    print(f"[HemoPI2] service: http://127.0.0.1:{run_port}/predict")
+    app.run(host=os.environ.get("HEMO_HOST", "127.0.0.1"), port=run_port, threaded=False)

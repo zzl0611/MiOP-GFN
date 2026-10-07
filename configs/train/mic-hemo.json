@@ -1,0 +1,38 @@
+{
+  "name": "mic-hemo",
+  "description": "Paper-aligned BERT-MIC + hemolysis configuration without auxiliary STOP or motif-diversity losses.",
+  "objectives": ["mic", "hemo"],
+  "mic_oracle": "bert",
+  "train_args": [
+    "--log_dir", "./outputs/training/paper_mic_hemo_10000_off020_rand015_seed0",
+    "--objectives", "mic", "hemo",
+    "--mic_oracle", "bert",
+    "--type", "ordering",
+    "--compute_hvi", "--compute_igd", "--compute_pc_entropy",
+    "--replay",
+    "--seed", "0",
+    "--num_training_steps", "10000",
+    "--offline_data", "./datasets/offline/bert_ec_final_offline_mic_priority_top2000.fasta",
+    "--offline_ratio", "0.20",
+    "--offline_reward_batch_size", "64",
+    "--global_batch_size", "64",
+    "--reward_cache_tag", "bert_ec_final_mic_priority_motif67",
+    "--motif_vocab_path", "./datasets/motifs/bpe_motif_vocab_bert_ec_final_mic_hemo_notox_effect005.txt",
+    "--max_motif_actions", "2",
+    "--use_motif_gate",
+    "--motif_use_gate_strength", "1.0",
+    "--motif_select_gate_strength", "1.0",
+    "--motif_usage_loss_weight", "0.0",
+    "--pareto_len_limit", "30",
+    "--replay_len_limit", "30",
+    "--train_random_action_prob", "0.15"
+  ],
+  "sampling": {
+    "motif_vocab_path": "./datasets/motifs/bpe_motif_vocab_bert_ec_final_mic_hemo_notox_effect005.txt",
+    "max_motif_actions": 2,
+    "min_length": 5,
+    "use_motif_gate": true,
+    "motif_use_gate_strength": 1.0,
+    "motif_select_gate_strength": 1.0
+  }
+}

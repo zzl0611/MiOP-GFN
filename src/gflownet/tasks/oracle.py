@@ -1,18 +1,51 @@
 import torch
 import requests
 import os
-import tempfile
-import subprocess
-import pandas as pd
 from pathlib import Path
 import sys
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validated_scores(values, expected_count: int, label: str, unit_interval: bool = False):
+    if values is None:
+        raise ValueError(f"{label} response is missing scores")
+    scores = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
+    if scores.numel() != expected_count:
+        raise ValueError(
+            f"{label} returned {scores.numel()} scores for {expected_count} sequences"
+        )
+    if not torch.isfinite(scores).all():
+        raise ValueError(f"{label} returned NaN or infinite scores")
+    if unit_interval and ((scores < 0).any() or (scores > 1).any()):
+        raise ValueError(f"{label} returned scores outside [0, 1]")
+    return scores
+
+
+def _oracle_failure(label: str, exc: Exception, count: int, fallback: float):
+    if _env_flag("ORACLE_ALLOW_FALLBACK", default=False):
+        print(
+            f"[WARNING] {label} failed; ORACLE_ALLOW_FALLBACK is enabled, "
+            f"so {fallback} will be used for {count} sequences. Error: {exc}"
+        )
+        return torch.full((count,), fallback, dtype=torch.float32)
+    raise RuntimeError(
+        f"{label} failed. Refusing to train with fabricated rewards. "
+        "Fix the reward service or explicitly set ORACLE_ALLOW_FALLBACK=1 "
+        "for debugging only."
+    ) from exc
 
 # =====================================================================
 # E. coli MIC Oracle
 # =====================================================================
 _THIS_FILE = Path(__file__).resolve()
-_MULTI_ROOT = _THIS_FILE.parents[2]
-_MIC_ORACLE_DIR = _MULTI_ROOT / "MIC_oracle"
+_REPO_ROOT = _THIS_FILE.parents[3]
+_MIC_ORACLE_DIR = _REPO_ROOT / "services" / "mic"
 
 if str(_MIC_ORACLE_DIR) not in sys.path:
     sys.path.append(str(_MIC_ORACLE_DIR))
@@ -39,9 +72,12 @@ class AMPOracle:
         # 🌟 动态从环境变量读取，默认强制设为 5004，与高级版 5000 物理隔离！
         target_port = os.environ.get("AMP_PORT", "5007")
         
-        self.api_url = f"http://127.0.0.1:{target_port}/predict"
+        self.api_url = os.environ.get(
+            "AMP_URL",
+            f"http://127.0.0.1:{target_port}/predict",
+        )
         
-        print(f"🚀 [AMP Oracle] 已切换为本地微服务极速模式！目标端口: {target_port}")
+        print(f"[AMP Oracle] using service: {self.api_url}")
 
     @torch.no_grad()
     def predict(self, seqs: list[str]) -> torch.Tensor:
@@ -54,24 +90,17 @@ class AMPOracle:
                 json={"sequences": seqs},
                 timeout=10,
             )
-
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("status") == "success":
-                    scores = result.get("scores")
-                else:
-                    scores = [0.0] * len(seqs)
-            else:
-                scores = [0.0] * len(seqs)
-
-        except requests.exceptions.RequestException:
-            print(
-                f"⚠️ 无法连接到 AMPlify 服务器 (端口 {self.api_url})！"
-                "是不是忘记在终端运行 amplify_server.py 了？"
+            response.raise_for_status()
+            result = response.json()
+            if result.get("status") != "success":
+                raise ValueError(f"service status is not success: {result}")
+            scores = _validated_scores(
+                result.get("scores"), len(seqs), "AMP oracle", unit_interval=True
             )
-            scores = [0.0] * len(seqs)
+        except Exception as exc:
+            scores = _oracle_failure("AMP oracle", exc, len(seqs), fallback=0.0)
 
-        return torch.tensor(scores, dtype=torch.float32, device=self.device)
+        return scores.to(self.device)
 
 # =====================================================================
 # 🌟 2. HemoOracle (溶血性裁判)
@@ -85,8 +114,11 @@ class HemoOracle:
     def __init__(self, device="cpu"):
         self.device = device
         target_port = os.environ.get("HEMO_PORT", "5006")
-        self.api_url = f"http://127.0.0.1:{target_port}/predict"
-        print(f"🚀 [Hemo Oracle] 已切换为本地微服务模式！目标端口: {target_port}")
+        self.api_url = os.environ.get(
+            "HEMO_URL",
+            f"http://127.0.0.1:{target_port}/predict",
+        )
+        print(f"[Hemo Oracle] using service: {self.api_url}")
 
     @torch.no_grad()
     def predict(self, seqs: list[str]) -> torch.Tensor:
@@ -100,20 +132,17 @@ class HemoOracle:
                 timeout=60,
             )
 
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("status") == "success":
-                    scores = result.get("scores", [0.5] * len(seqs))
-                else:
-                    scores = [0.5] * len(seqs)
-            else:
-                scores = [0.5] * len(seqs)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("status") != "success":
+                raise ValueError(f"service status is not success: {result}")
+            scores = _validated_scores(
+                result.get("scores"), len(seqs), "Hemo oracle", unit_interval=True
+            )
+        except Exception as exc:
+            scores = _oracle_failure("Hemo oracle", exc, len(seqs), fallback=0.5)
 
-        except requests.exceptions.RequestException:
-            print(f"⚠️ 无法连接到 HemoPI2 服务器 ({self.api_url})！是不是忘记启动 hemo_server.py 了？")
-            scores = [0.5] * len(seqs)
-
-        return torch.tensor(scores, dtype=torch.float32, device=self.device)
+        return scores.to(self.device)
 
 
 # =====================================================================
@@ -125,7 +154,7 @@ class HydrophobicMomentOracle:
     """
     def __init__(self, device="cpu"):
         self.device = device
-        print("✅ [HMoment Oracle] modlAMP 物理化学计算引擎准备就绪！")
+        print("[HMoment Oracle] modlAMP descriptor is ready")
 
     def predict(self, seqs: list[str]) -> torch.Tensor:
         scores = []
@@ -169,20 +198,17 @@ class ToxOracle:
                 timeout=120,
             )
 
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("status") == "success":
-                    scores = result.get("scores", [0.5] * len(seqs))
-                else:
-                    scores = [0.5] * len(seqs)
-            else:
-                scores = [0.5] * len(seqs)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("status") != "success":
+                raise ValueError(f"service status is not success: {result}")
+            scores = _validated_scores(
+                result.get("scores"), len(seqs), "Tox oracle", unit_interval=True
+            )
+        except Exception as exc:
+            scores = _oracle_failure("Tox oracle", exc, len(seqs), fallback=0.5)
 
-        except requests.exceptions.RequestException as e:
-            print(f"Cannot connect to ToxPred3 service {self.api_url}: {e}")
-            scores = [0.5] * len(seqs)
-
-        return torch.tensor(scores, dtype=torch.float32, device=self.device)
+        return scores.to(self.device)
 
 
 # =====================================================================
@@ -192,7 +218,7 @@ class EcoliMICOracle:
     """
     E. coli-specific MIC oracle for OP-GFN.
 
-    这个类包装 MIC_oracle/ecoli_mic_oracle.py 里面的独立预测器，
+    这个类包装 services/mic/ecoli_mic_oracle.py 里面的可选独立预测器，
     让 amp_moo.py 可以直接从 gflownet.tasks.oracle 导入它。
 
     predict(seqs) 返回的是 ecoli_score，越大越好。
@@ -202,7 +228,7 @@ class EcoliMICOracle:
     def __init__(self, device="cpu", model_path=None, batch_size=32):
         if _StandaloneEcoliMICOracle is None:
             raise ImportError(
-                "Cannot import standalone EcoliMICOracle from MIC_oracle/ecoli_mic_oracle.py. "
+                "Cannot import standalone EcoliMICOracle from services/mic/ecoli_mic_oracle.py. "
                 f"Original error: {_ECOLI_MIC_IMPORT_ERROR}"
             )
 
@@ -224,7 +250,7 @@ class EcoliMICOracle:
         )
 
         print(
-            f"✅ [Ecoli MIC Oracle] 已加载 ESM2-Ridge E. coli MIC 预测器！"
+            f"[Ecoli MIC Oracle] loaded ESM2-Ridge predictor;"
             f" model_path={self.model_path}"
         )
 
@@ -295,7 +321,10 @@ class BERTMICOracle:
                 f"Available keys: {list(out.keys())}"
             )
 
-        return np.asarray(out[self.output_key], dtype=np.float32)
+        scores = _validated_scores(
+            out[self.output_key], len(seqs), "BERT MIC oracle", unit_interval=True
+        )
+        return scores.numpy()
 
     @torch.no_grad()
     def predict(self, seqs: list[str]) -> torch.Tensor:
@@ -390,7 +419,10 @@ class MBCMICOracle:
                 f"Available keys: {list(out.keys())}"
             )
 
-        return np.asarray(out[self.output_key], dtype=np.float32)
+        scores = _validated_scores(
+            out[self.output_key], len(seqs), "MBC MIC oracle", unit_interval=False
+        )
+        return scores.numpy()
 
     @torch.no_grad()
     def predict(self, seqs: list[str]) -> torch.Tensor:
@@ -421,3 +453,35 @@ class MBCMICOracle:
 
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read().decode())
+
+
+def preflight_reward_oracles(
+    objectives,
+    mic_oracle_name="bert",
+    sample_sequence="KIVRIFFKILKF",
+):
+    """Run one real prediction through every selected training reward oracle."""
+    selected = list(objectives)
+    oracles = {}
+    if "amp" in selected:
+        oracles["amp"] = AMPOracle(device="cpu")
+    if "hemo" in selected:
+        oracles["hemo_probability"] = HemoOracle(device="cpu")
+    if "hmoment" in selected:
+        oracles["hmoment"] = HydrophobicMomentOracle(device="cpu")
+    if "mic" in selected:
+        if mic_oracle_name == "bert":
+            oracles["mic"] = BERTMICOracle(output_key="mic_score")
+        elif mic_oracle_name == "mbc":
+            oracles["mic"] = MBCMICOracle(output_key="pmic")
+        else:
+            raise ValueError(f"Unknown MIC oracle: {mic_oracle_name}")
+    if "tox" in selected:
+        oracles["tox_probability"] = ToxOracle(device="cpu")
+
+    results = {}
+    for name, oracle in oracles.items():
+        score = oracle.predict([sample_sequence])
+        score = _validated_scores(score, 1, name, unit_interval=True)
+        results[name] = float(score.item())
+    return results

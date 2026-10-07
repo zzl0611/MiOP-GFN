@@ -1,7 +1,9 @@
 import os
 import re
+import shutil
 import tempfile
 import subprocess
+from pathlib import Path
 from typing import Dict, List
 
 import pandas as pd
@@ -9,13 +11,33 @@ from flask import Flask, request, jsonify
 
 
 VALID_AA = "ACDEFGHIKLMNPQRSTVWY"
-TOXINPRED3_BIN = os.environ.get(
-    "TOXINPRED3_BIN",
-    "/home/lzz/anaconda3/envs/toxinpred3_env/bin/toxinpred3",
-)
+def resolve_toxinpred3_bin() -> str:
+    configured = os.environ.get("TOXINPRED3_BIN")
+    candidate = configured or shutil.which("toxinpred3")
+    if not candidate:
+        raise FileNotFoundError(
+            "ToxinPred3 executable was not found. Set TOXINPRED3_BIN to its "
+            "absolute path or add toxinpred3 to PATH."
+        )
+    path = Path(candidate).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"ToxinPred3 executable does not exist: {path}")
+    return str(path)
+
+
+TOXINPRED3_BIN = resolve_toxinpred3_bin()
 
 app = Flask(__name__)
 CACHE: Dict[str, float] = {}
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "executable": TOXINPRED3_BIN,
+        "score_type": "toxicity_probability",
+    })
 
 
 def clean_sequence(seq: str) -> str:
@@ -231,4 +253,4 @@ if __name__ == "__main__":
     run_port = int(os.environ.get("TOX_PORT", 5008))
     print(f"ToxPred3 service: http://127.0.0.1:{run_port}/predict")
     print(f"TOXINPRED3_BIN={TOXINPRED3_BIN}")
-    app.run(host="127.0.0.1", port=run_port, threaded=False)
+    app.run(host=os.environ.get("TOX_HOST", "127.0.0.1"), port=run_port, threaded=False)

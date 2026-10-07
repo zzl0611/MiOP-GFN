@@ -1,10 +1,11 @@
 import os
-# 🌟 严格保护底层上下文：指定卡1必须在所有深度学习计算图构建前！
+# 与正式训练命令一致：外部未指定显卡时默认只暴露物理 GPU 0。
+# 必须在导入 torch 前设置；外部 CUDA_VISIBLE_DEVICES 仍具有更高优先级。
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 import random
 import numpy as np
 import shutil
-import math
 from pathlib import Path
 from torch.utils.data import Dataset
 from typing import List, Tuple, Dict
@@ -22,7 +23,15 @@ from gflownet.models.seq_model import SeqTransformerGFN
 from gflownet.algo.seq_trajectory_balance import SeqTrajectoryBalance
 
 # 🌟 核心导入：集结三大预言机 (AMP, Hemo, HMoment)
-from gflownet.tasks.oracle import AMPOracle, HemoOracle, HydrophobicMomentOracle, EcoliMICOracle, ToxOracle, MBCMICOracle,BERTMICOracle
+from gflownet.tasks.oracle import (
+    AMPOracle,
+    BERTMICOracle,
+    HemoOracle,
+    HydrophobicMomentOracle,
+    MBCMICOracle,
+    ToxOracle,
+    preflight_reward_oracles,
+)
 from gflownet.utils.multiobjective_hooks import MultiObjectiveStatsHook
 from gflownet.utils.reproducibility import build_amp_reproducibility_manifest
 
@@ -93,10 +102,14 @@ class AMPMOOTask(SEHMOOTask):
         self.objectives = self.real_objs
         cfg.task.seh_moo.objectives = self.real_objs
 
-        # 挂载三大真实裁判
-        self.amp_oracle = AMPOracle(device="cpu")
-        self.hemo_oracle = HemoOracle(device="cpu")
-        self.hmoment_oracle = HydrophobicMomentOracle(device="cpu")
+        # 只初始化本次训练真正选择的奖励预测器。
+        self.amp_oracle = AMPOracle(device="cpu") if "amp" in self.objectives else None
+        self.hemo_oracle = HemoOracle(device="cpu") if "hemo" in self.objectives else None
+        self.hmoment_oracle = (
+            HydrophobicMomentOracle(device="cpu")
+            if "hmoment" in self.objectives
+            else None
+        )
         if "mic" in self.objectives:
             mic_oracle_name = getattr(self, "mic_oracle_name", "mbc")
 
@@ -187,7 +200,7 @@ class AMPMOOTask(SEHMOOTask):
                 if obj_name in obj_scores:
                     flat_r.append(obj_scores[obj_name])
                 else:
-                    raise ValueError(f"⚠️ 预言机中未定义目标: {obj_name}，请检查启动命令！")
+                    raise ValueError(f"预言机中未定义目标: {obj_name}，请检查启动命令！")
 
             if len(flat_r) > 0:
                 flat_rewards = torch.stack(flat_r, dim=1).detach().cpu()
@@ -330,7 +343,7 @@ class AMPMOOTrainer(StandardOnlineTrainer):
             self.sampling_hooks.append(moo_hook)
         else:
             self.sampling_hooks = [moo_hook]
-        print("✅ [Hook] 多目标顶会评估雷达已完美植入！")
+        print("[Hook] multi-objective statistics hook enabled")
 
     def setup_task(self):
         self.task = AMPMOOTask(
@@ -400,23 +413,9 @@ class AMPMOOTrainer(StandardOnlineTrainer):
         # 将命令行里的开关传递给底层算法
         self.algo.use_global_rank = getattr(self.cmd_args, 'use_global_rank', False)
 
-        # 新增：把 offline stop loss 权重直接挂到 algo 上
-        # 不放进 hps["algo"]，避免 OmegaConf 报 ConfigKeyError
-        self.algo.offline_stop_loss_weight = getattr(
-            self.cmd_args,
-            "offline_stop_loss_weight",
-            0.0
-        )
-
         self.algo.motif_usage_loss_weight = getattr(
             self.cmd_args,
             "motif_usage_loss_weight",
-            0.0
-        )
-
-        self.algo.motif_diversity_loss_weight = getattr(
-            self.cmd_args,
-            "motif_diversity_loss_weight",
             0.0
         )
 
@@ -424,18 +423,6 @@ class AMPMOOTrainer(StandardOnlineTrainer):
             self.cmd_args,
             "pareto_len_limit",
             30,
-        )
-
-        self.algo.online_stop_len = getattr(
-            self.cmd_args,
-            "online_stop_len",
-            20,
-        )
-
-        self.algo.online_stop_loss_weight = getattr(
-            self.cmd_args,
-            "online_stop_loss_weight",
-            0.0,
         )
 
         self.algo.replay_len_limit = getattr(
@@ -449,10 +436,7 @@ class AMPMOOTrainer(StandardOnlineTrainer):
             f"use_gate_strength={getattr(self.cmd_args, 'motif_use_gate_strength', 1.0)}, "
             f"select_gate_strength={getattr(self.cmd_args, 'motif_select_gate_strength', 1.0)}, "
             f"usage_loss_weight={self.algo.motif_usage_loss_weight}, "
-            f"diversity_loss_weight={self.algo.motif_diversity_loss_weight},"
             f"pareto_len_limit={self.algo.pareto_len_limit}, "
-            f"online_stop_len={self.algo.online_stop_len}, "
-            f"online_stop_loss_weight={self.algo.online_stop_loss_weight}, "
             f"replay_len_limit={self.algo.replay_len_limit}"
         )
 
@@ -462,6 +446,13 @@ class AMPMOOTrainer(StandardOnlineTrainer):
 def main(args):
     if isinstance(args.objectives, str):
         args.objectives = args.objectives.split()
+
+    if not args.skip_oracle_preflight:
+        scores = preflight_reward_oracles(
+            objectives=args.objectives,
+            mic_oracle_name=args.mic_oracle,
+        )
+        print(f"[Oracle preflight] all selected reward services passed: {scores}")
 
     hps = {
         "log_dir": args.log_dir,
@@ -473,7 +464,7 @@ def main(args):
         "validate_every": 200,
         "num_workers": 0,
         "algo": {
-            "global_batch_size": 128,
+            "global_batch_size": args.global_batch_size,
             "offline_ratio":args.offline_ratio if args.offline_data else 0.0,        
             "valid_offline_ratio": 0.0,   
             "method": "TB",
@@ -519,26 +510,57 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--log_dir", default="./logs/baseline_run", type=str)
+    parser.add_argument(
+        "--log_dir",
+        default="./outputs/training/paper_mic_hemo_10000_off020_rand015_seed0",
+        type=str,
+    )
     
-    # 🌟 默认锁定三大目标 (支持在命令行里任意删减)
-    parser.add_argument("--objectives", default=["amp", "hemo", "hmoment"], nargs="+", type=str,help="优化目标，可选: amp hemo hmoment mic")
+    # 默认使用与论文方法一致的 BERT-MIC + Hemo 双目标配置。
+    parser.add_argument(
+        "--objectives",
+        default=["mic", "hemo"],
+        nargs="+",
+        type=str,
+        help="优化目标，可选: amp hemo hmoment mic tox",
+    )
     
-    parser.add_argument("--replay", action='store_true')
+    parser.add_argument(
+        "--replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--type", default='ordering', choices=['pref', 'goal', 'ordering'])
     
     parser.add_argument("--use_global_rank", action="store_true", help="启用多级软标签 (ICLR 2025 路线 B)")
-    parser.add_argument("--compute_hvi", action="store_true", default=False)
-    parser.add_argument("--compute_igd", action="store_true", default=False)
-    parser.add_argument("--compute_pc_entropy", action="store_true", default=False)
+    parser.add_argument("--compute_hvi", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--compute_igd", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--compute_pc_entropy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     
-    parser.add_argument("--offline_data", default=None, type=str)
-    parser.add_argument("--offline_ratio", default=0.25, type=float)
+    parser.add_argument(
+        "--offline_data",
+        default="./datasets/offline/bert_ec_final_offline_mic_priority_top2000.fasta",
+        type=str,
+    )
+    parser.add_argument("--offline_ratio", default=0.20, type=float)
     parser.add_argument("--offline_reward_batch_size", default=64, type=int)
     parser.add_argument(
+        "--global_batch_size",
+        default=64,
+        type=int,
+        help=(
+            "训练轨迹 batch size。0627 历史训练为 64；"
+            "它与 offline_reward_batch_size 是两个不同参数。"
+        ),
+    )
+    parser.add_argument(
         "--mic_oracle",
-        default="mbc",
+        default="bert",
         choices=["mbc", "bert"],
         type=str,
         help="MIC oracle backend: mbc uses MBC_MIC_PORT/5011, bert uses MIC_BERT_PORT/5010.",
@@ -548,21 +570,25 @@ if __name__ == "__main__":
     # ===============================
     # 单层 motif 动作空间参数
     # ===============================
-    parser.add_argument("--motif_vocab_path",default="./motif_discovery/bpe_motif_vocab_final.txt",type=str,help="Top motif 词表路径，每行一个 motif。")
+    parser.add_argument(
+        "--motif_vocab_path",
+        default="./datasets/motifs/bpe_motif_vocab_bert_ec_final_mic_hemo_notox_effect005.txt",
+        type=str,
+        help="Top motif 词表路径，每行一个 motif。",
+    )
 
     parser.add_argument("--max_motif_actions",default=2,type=int,help="每条生成轨迹最多允许使用几个 motif 动作。默认 2。")
 
 
     parser.add_argument("--min_length",default=5,type=int,help="最短肽链长度。短于该长度不允许 STOP。默认 5。")
 
-    parser.add_argument("--train_random_action_prob",default=0.05,type=float,help="训练时随机探索概率。motif 动作空间较大，建议 0.05 起步。")
+    parser.add_argument("--train_random_action_prob",default=0.15,type=float,help="训练时随机探索概率。")
 
-    parser.add_argument("--num_training_steps",default=5000,type=int,help="训练步数。debug 时可以设为 50 或 100。")
-    parser.add_argument("--offline_stop_loss_weight",default=0.5,type=float,help="离线短肽终点 STOP 监督损失权重。0 表示关闭。")
-    
+    parser.add_argument("--num_training_steps",default=10000,type=int,help="训练步数。debug 时可以设为 50 或 100。")
     parser.add_argument(
         "--use_motif_gate",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="启用 motif 双门控。不开这个参数时，模型保持原来的 motif 动作打分方式。"
     )
 
@@ -588,13 +614,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--motif_diversity_loss_weight",
-        default=0.0,
-        type=float,
-        help="motif 多样性正则权重。越大，越鼓励使用不同 motif。0 表示关闭。"
-    )
-
-    parser.add_argument(
         "--pareto_len_limit",
         default=30,
         type=int,
@@ -602,21 +621,8 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--online_stop_len",
-        default=20,
-        type=int,
-        help="online 轨迹中，当前状态长度达到该值后开始鼓励 STOP。",
-    )
-
-    parser.add_argument(
-        "--online_stop_loss_weight",
-        default=0.5,
-        type=float,
-        help="online STOP 辅助损失权重。0 表示关闭。",
-    )
-    parser.add_argument(
         "--reward_cache_tag",
-        default="mbcmic",
+        default="bert_ec_final_mic_priority_motif67",
         type=str,
         help="离线 reward 缓存标签，用于区分不同 MIC oracle，例如 bertmic、esm2mic。",
     )
@@ -625,6 +631,14 @@ if __name__ == "__main__":
         default=30,
         type=int,
         help="长度超过该值的 online 序列不放入 replay buffer。",
+    )
+    parser.add_argument(
+        "--skip_oracle_preflight",
+        action="store_true",
+        help=(
+            "跳过训练前的真实奖励预测检查。仅建议纯离线调试使用；"
+            "在线训练应保持预检开启。"
+        ),
     )
     args = parser.parse_args()
     main(args)

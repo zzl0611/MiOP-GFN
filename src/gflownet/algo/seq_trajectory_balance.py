@@ -1,5 +1,4 @@
 import torch
-import math
 import torch.nn as nn
 from torch_scatter import scatter
 
@@ -28,9 +27,6 @@ class SeqTrajectoryBalance:
         self.bootstrap_own_reward = getattr(self.cfg, 'bootstrap_own_reward', False)
         self.motif_usage_loss_weight = float(
             getattr(self.global_cfg.algo, "motif_usage_loss_weight", 0.0)
-        )
-        self.motif_diversity_loss_weight = float(
-            getattr(self.global_cfg.algo, "motif_diversity_loss_weight", 0.0)
         )
 
     def create_training_data_from_graphs(self, graphs):
@@ -402,107 +398,10 @@ class SeqTrajectoryBalance:
             traj_losses = (numerator - denominator).pow(2)
             loss = traj_losses.mean()
 
-        # ==========================================================
-        # Offline Stop Loss:
-        # 只监督离线短肽轨迹的最后一步，让模型在短肽终点更愿意 STOP。
-        # 不修改 amp/hemo reward，也不影响 Pareto 分数。
-        # ==========================================================
-        offline_stop_loss_weight = getattr(self, "offline_stop_loss_weight", 0.0)
-
-        if (
-            offline_stop_loss_weight > 0
-            and hasattr(batch, "num_offline")
-            and batch.num_offline > 0
-        ):
-            # 每条轨迹摊平成状态-动作对后，找到每条轨迹最后一个动作的位置
-            traj_end_idx = torch.cumsum(batch.traj_lens, dim=0) - 1
-
-            # SamplingIterator 里离线轨迹排在 batch 最前面
-            offline_end_idx = traj_end_idx[:batch.num_offline]
-
-            # 离线短肽终点状态下，STOP 动作的 log probability
-            stop_log_probs = log_probs[offline_end_idx, self.ctx.stop_action_idx]
-
-            # 最大化 P(STOP | 离线短肽终点)
-            stop_loss = -stop_log_probs.mean()
-
-            loss = loss + offline_stop_loss_weight * stop_loss
-
-            offline_stop_prob = stop_log_probs.exp().mean()
-            offline_end_is_stop = (
-                batch.actions[offline_end_idx] == self.ctx.stop_action_idx
-            ).float().mean()
-        else:
-            stop_loss = torch.tensor(0.0, device=dev)
-            offline_stop_prob = torch.tensor(0.0, device=dev)
-            offline_end_is_stop = torch.tensor(0.0, device=dev)
-
-        # ==========================================================
-        # Online Stop Loss:
-        # 不修改 MIC/HEMO/MIC-TOX reward。
-        # 对 online 轨迹中长度 >= online_stop_len 的中间状态，
-        # 鼓励模型提高 STOP 动作概率。
-        #
-        # 注意：
-        # 这不是长度 reward；它只作用于策略的 STOP 行为。
-        # ==========================================================
-        online_stop_loss_weight = float(
-            getattr(self, "online_stop_loss_weight", 0.0)
-        )
-
-        online_stop_len = int(
-            getattr(self, "online_stop_len", 20)
-        )
-
-        online_stop_loss = torch.tensor(0.0, device=dev)
-        online_stop_prob = torch.tensor(0.0, device=dev)
-        online_stop_state_frac = torch.tensor(0.0, device=dev)
-
-        if (
-            online_stop_loss_weight > 0
-            and hasattr(batch, "num_offline")
-            and int(getattr(batch, "num_online", 0)) > 0
-        ):
-            num_offline = int(getattr(batch, "num_offline", 0))
-
-            # trajectory 级别：哪些轨迹是 online
-            traj_is_online = torch.arange(num_trajs, device=dev) >= num_offline
-
-            # state 级别：每个展开状态属于哪条轨迹
-            state_is_online = traj_is_online[batch_idx]
-
-            # 每个展开状态当前的序列长度
-            state_lengths = batch.lengths.to(dev)
-
-            # 只在 STOP 合法的状态上监督
-            action_mask = model_inputs["action_mask"].bool().to(dev)
-            stop_is_legal = action_mask[:, self.ctx.stop_action_idx]
-
-            online_stop_states = (
-                state_is_online
-                & stop_is_legal
-                & (state_lengths >= online_stop_len)
-            )
-
-            if online_stop_states.any():
-                online_stop_log_probs = log_probs[
-                    online_stop_states,
-                    self.ctx.stop_action_idx,
-                ]
-
-                online_stop_loss = -online_stop_log_probs.mean()
-                loss = loss + online_stop_loss_weight * online_stop_loss
-
-                online_stop_prob = online_stop_log_probs.exp().mean()
-                online_stop_state_frac = online_stop_states.float().mean()
-
         motif_usage_loss_weight = float(getattr(self, "motif_usage_loss_weight", 0.0))
-        motif_diversity_loss_weight = float(getattr(self, "motif_diversity_loss_weight", 0.0))
 
         motif_usage_penalty = torch.tensor(0.0, device=dev)
         motif_usage_loss = torch.tensor(0.0, device=dev)
-        motif_diversity_score = torch.tensor(0.0, device=dev)
-        motif_diversity_loss = torch.tensor(0.0, device=dev)
 
         motif_start = getattr(self.ctx, "motif_action_start", self.ctx.vocab_size)
         motif_end = getattr(self.ctx, "motif_action_end", self.ctx.stop_action_idx)
@@ -541,47 +440,15 @@ class SeqTrajectoryBalance:
                 motif_usage_loss = motif_usage_loss_weight * motif_usage_penalty
                 loss = loss + motif_usage_loss
 
-            if motif_diversity_loss_weight > 0:
-                eligible_states = state_is_online & motif_mask.any(dim=1)
-
-                if eligible_states.any():
-                    motif_mass_by_id = motif_probs[eligible_states].sum(dim=0)
-                    legal_motif_ids = motif_mask[eligible_states].any(dim=0)
-                    motif_mass_by_id = motif_mass_by_id[legal_motif_ids]
-
-                    if motif_mass_by_id.numel() > 1:
-                        motif_dist = motif_mass_by_id / motif_mass_by_id.sum().clamp_min(1e-8)
-                        motif_entropy = -(
-                            motif_dist * motif_dist.clamp_min(1e-8).log()
-                        ).sum()
-
-                        max_entropy = math.log(float(motif_dist.numel()))
-                        motif_diversity_score = motif_entropy / max_entropy
-
-                        motif_diversity_loss = -motif_diversity_loss_weight * motif_diversity_score
-                        loss = loss + motif_diversity_loss
-
         info = {
             "loss": loss.item(),
             "logZ": log_Z.mean().item(),
             "invalid_trajectories": (1 - batch.is_valid).mean().item(),
             "num_offline": float(getattr(batch, "num_offline", -1)),
             "num_online": float(getattr(batch, "num_online", -1)),
-            "offline_stop_loss": stop_loss.item(),
-            "offline_stop_prob": offline_stop_prob.item(),
-            "offline_end_is_stop": offline_end_is_stop.item(),
-            "offline_stop_loss_weight": float(offline_stop_loss_weight),
             "motif_usage_penalty": motif_usage_penalty.item(),
             "motif_usage_loss": motif_usage_loss.item(),
             "motif_usage_loss_weight": float(motif_usage_loss_weight),
-            "motif_diversity_score": motif_diversity_score.item(),
-            "motif_diversity_loss": motif_diversity_loss.item(),
-            "motif_diversity_loss_weight": float(motif_diversity_loss_weight),
-            "online_stop_loss": online_stop_loss.item(),
-            "online_stop_prob": online_stop_prob.item(),
-            "online_stop_state_frac": online_stop_state_frac.item(),
-            "online_stop_loss_weight": float(online_stop_loss_weight),
-            "online_stop_len": float(online_stop_len),
             "pareto_len_limit": float(getattr(self, "pareto_len_limit", 30)),
             "replay_len_limit": float(getattr(self, "replay_len_limit", 30)),
         }
